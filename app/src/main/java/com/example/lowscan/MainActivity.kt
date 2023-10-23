@@ -12,12 +12,15 @@ import androidx.appcompat.widget.SwitchCompat
 import org.opencv.android.OpenCVLoader
 import org.opencv.android.Utils
 import org.opencv.core.Core
+import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import org.opencv.imgproc.Moments
+import com.example.lowscan.orderPoints
 
 class MainActivity : AppCompatActivity() {
 
@@ -26,7 +29,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var switchFilter: SwitchCompat
 
     private var imageBitmap: Bitmap? = null
-
+    private var imageMat: Mat? = null // Full resolution image
+    private var processMat: Mat? = null // Reduced image for processing and temporary display
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -79,7 +83,6 @@ class MainActivity : AppCompatActivity() {
         processImage(brightness, switchFilter.isChecked)
     }
 
-
     private fun mapSeekBarProgressToValue(
         progress: Int,
         minValue: Double,
@@ -102,13 +105,22 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+    // Display the image
+    private fun showImage() {
+        val bwBitmap = Bitmap.createBitmap(processMat.cols(), processMat.rows(), Bitmap.Config.RGB_565)
+        // Step 7: Convert the filtered grayscale Mat back to a Bitmap format
+        Utils.matToBitmap(processMat, bwBitmap)
+        // Step 8: Set the filtered Bitmap (bwBitmap) to be displayed in the ImageView
+        imageView.setImageBitmap(bwBitmap)
+    }
+
     // Process the captured or selected image with OpenCV and display the result
     private fun processImage(
         brightness: Double = -30.0,
         isGrayScale: Boolean = false
     ) {
         // Step 1: Create a Mat object to hold the image data
-        val imageMat = Mat()
+        imageMat = Mat()
         // Step 2: Convert the input imageBitmap to a Mat object (OpenCV format)
         Utils.bitmapToMat(imageBitmap, imageMat)
         // Scaling down the image for faster processing
@@ -120,37 +132,37 @@ class MainActivity : AppCompatActivity() {
         val tinySize = Size(tinyWidth.toDouble(),tinyHeight.toDouble())
 //        val tinyMat = Mat()
         var grayMat = Mat()
-        Imgproc.resize(imageMat,grayMat,tinySize)
+        Imgproc.resize(imageMat,processMat,tinySize)
 
         // Extract channel with the best contrast for the ink to be detected
         val prefChannel = "Green"
         when (prefChannel) {
             "Red" -> {
-                Core.extractChannel(grayMat, grayMat, 2) // Extract the Red channel (0-based index)
+                Core.extractChannel(processMat, processMat, 2) // Extract the Red channel (0-based index)
             }
             "Green" -> {
-                Core.extractChannel(grayMat, grayMat, 1) // Extract the Green channel (0-based index)
+                Core.extractChannel(processMat, processMat, 1) // Extract the Green channel (0-based index)
             }
             "Blue" -> {
-                Core.extractChannel(grayMat, grayMat, 0) // Extract the Blue channel (0-based index)
+                Core.extractChannel(processMat, processMat, 0) // Extract the Blue channel (0-based index)
             }
             else -> {
                 // Handle the case when 'prefChannel' is not one of the specified colors-> grayscale
-                Imgproc.cvtColor(grayMat,grayMat,Imgproc.COLOR_BGR2GRAY)
+                Imgproc.cvtColor(processMat,processMat,Imgproc.COLOR_BGR2GRAY)
             }
         }
 
         // Blur
-        Imgproc.GaussianBlur(grayMat,grayMat, Size(5.0, 5.0),0.0)
+        Imgproc.GaussianBlur(processMat,processMat, Size(5.0, 5.0),0.0)
 
         // Canny
 //        var edgeMat = Mat()
-        Imgproc.Canny(grayMat,grayMat,75.0,200.0)
+        Imgproc.Canny(processMat,processMat,75.0,200.0)
 
         // -> Show Canny for debug? maybe user can close the quadrilateral themself
         val contours = ArrayList<MatOfPoint>()
         val hierarchy = Mat()
-        Imgproc.findContours(grayMat.clone(), contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
+        Imgproc.findContours(processMat.clone(), contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
 
 //        contours.sortWith(Comparator { c1, c2 ->
 //            (Imgproc.contourArea(c1) - Imgproc.contourArea(c2)).toInt()
@@ -160,13 +172,47 @@ class MainActivity : AppCompatActivity() {
         contours.sortByDescending { Imgproc.contourArea(it) }
         val selectedContours = contours.take(5)
 
+        showImage()
 //        # Loop over the contours
-//                first = True
-//        plt.figure()
-//        plt.imshow(gray,cmap="gray",vmin=0,vmax=255)
-//        previous_area = -1
-//        image_area = image.shape[0]*image.shape[1]
-//        for c in cnts:
+        var previousArea = -1.0
+        val imageArea = tinyWidth * tinyHeight
+        var finalCnt = MatOfPoint2f()
+        var first = true
+
+        for (c in contours) {
+            // Convert the contour to MatOfPoint2f
+            val c2f = MatOfPoint2f()
+            c.convertTo(c2f, CvType.CV_32F)
+
+            // Approximate the contour
+            val peri = Imgproc.arcLength(c2f, true)
+            val approx = MatOfPoint2f()
+            Imgproc.approxPolyDP(c2f, approx, 0.02 * peri, true)
+
+            // If our approximated contour has four points, then we
+            // can assume that we have found our screen
+            if (approx.rows() == 4) {
+                val area = Imgproc.contourArea(approx)
+
+                if (first && area < 0.99 * imageArea) {
+                    // Eliminate too big rectangle (image border)
+                    finalCnt = approx
+                    previousArea = area
+                } else if (0.7 * previousArea < area && area < 0.9 * previousArea) {
+                    // We keep the last nested rectangle which is at least 70% as big as
+                    // the previous one, but at most 85% as big as the previous
+                    // to get the biggest one if two consecutive rectangles are very close
+                    finalCnt = approx
+                    previousArea = area
+                }
+
+                first = false
+            }
+        }
+
+        val pointsOrdered= orderPoints(finalCnt)
+
+
 //        # approximate the contour
 //        peri = cv2.arcLength(c, True)
 //        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
@@ -229,19 +275,9 @@ class MainActivity : AppCompatActivity() {
 //                kernel = np.ones((2, 2), np.uint8)
 //        img_dilation = cv2.dilate(warped_thresh, kernel, iterations=1)
 //        img_erosion = cv2.erode(img_dilation, kernel, iterations=1)
-
-
         // */
-
-        if (!isGrayScale)
-            grayMat = imageMat
-        // Step 5: Adjust the brightness of the grayscale image (optional)
-        Core.add(grayMat, Scalar.all(brightness), grayMat) // Adjust brightness (optional)
-        // Step 6: Create a new Bitmap named bwBitmap to hold the final filtered image
-        val bwBitmap = Bitmap.createBitmap(grayMat.cols(), grayMat.rows(), Bitmap.Config.RGB_565)
-        // Step 7: Convert the filtered grayscale Mat back to a Bitmap format
-        Utils.matToBitmap(grayMat, bwBitmap)
-        // Step 8: Set the filtered Bitmap (bwBitmap) to be displayed in the ImageView
-        imageView.setImageBitmap(bwBitmap)
+//        Core.add(grayMat, Scalar.all(brightness), grayMat) // Adjust brightness (optional)
+//        // Step 5: Adjust the brightness of the grayscale image (optional)
+//        Core.add(grayMat, Scalar.all(brightness), grayMat) // Adjust brightness (optional)
     }
 }
